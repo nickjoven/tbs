@@ -181,6 +181,36 @@
   }
   .hidden { display: none; }
 
+  /* History */
+  .hist-entry {
+    padding: 4px 6px; border-bottom: 1px solid var(--border);
+    cursor: pointer; border-radius: 2px;
+  }
+  .hist-entry:hover { background: var(--accent-bg); }
+  .hist-entry.selected { background: var(--accent-dim); }
+  .hist-title { color: var(--text); }
+  .hist-url { color: var(--text-dim); font-size: 10px; display: block;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .hist-meta { color: var(--text-dim); font-size: 10px; display: flex; gap: 8px; }
+  .hist-cid { font-size: 9px; color: var(--purple); }
+  .hist-domain-header {
+    color: var(--accent); font-size: 11px; padding: 4px 0 2px;
+    border-bottom: 1px solid var(--border); margin-top: 8px;
+    display: flex; justify-content: space-between;
+  }
+
+  /* Diff */
+  .diff-banner {
+    padding: 4px 8px; border-radius: 3px; margin-bottom: 8px;
+    font-size: 11px; border: 1px solid var(--border);
+  }
+  .diff-banner.changed { border-color: var(--warn); color: var(--warn); }
+  .diff-banner.same { border-color: var(--green); color: var(--green); }
+  .diff-line { padding: 1px 0; font-size: 11px; }
+  .diff-added { color: var(--green); }
+  .diff-removed { color: var(--red); }
+  .diff-changed { color: var(--warn); }
+
   /* Help */
   .help-overlay {
     display: none; position: fixed; inset: 0; z-index: 100;
@@ -208,6 +238,7 @@
   <button class="tab-btn" data-view="links">lnk</button>
   <button class="tab-btn" data-view="forms">frm</button>
   <button class="tab-btn" data-view="raw">raw</button>
+  <button class="tab-btn" data-view="history">hst</button>
   <input id="filter" type="text" placeholder="/ filter" spellcheck="false">
 </div>
 
@@ -228,11 +259,14 @@
     <div class="help-row"><span>open link</span><kbd>Enter</kbd></div>
     <div class="help-row"><span>copy row</span><kbd>y</kbd></div>
     <div class="help-row"><span>copy section as JSON</span><kbd>Y</kbd></div>
+    <div class="help-row"><span>export as markdown</span><kbd>x</kbd></div>
+    <div class="help-row"><span>export as JSON</span><kbd>X</kbd></div>
     <div class="help-row"><span>clear / close</span><kbd>Esc</kbd></div>
     <div class="help-row"><span>help</span><kbd>?</kbd></div>
   </div>
 </div>
 
+<script src="store.js"></script>
 <script src="sidepanel.js"></script>
 </body>
 </html>

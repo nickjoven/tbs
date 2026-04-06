@@ -4,11 +4,14 @@
   "use strict";
 
   let data = null;
+  let currentCid = null;       // CID of current extraction
+  let lastDiff = null;         // diff result from storage
   let currentView = "surfaces";
   let selectedIdx = -1;
   let selectables = [];        // flat list of selectable DOM nodes
   let treeNodes = new Map();   // id -> { el, childrenEl, expanded, depth }
   let sortState = {};          // tableIndex -> { col, asc }
+  const store = window.TabloscoStore;
 
   const $ = (s, p) => (p || document).querySelector(s);
   const $$ = (s, p) => [...(p || document).querySelectorAll(s)];
@@ -30,13 +33,31 @@
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
     if (!tab) { statusEl.textContent = "no active tab"; return; }
 
-    chrome.tabs.sendMessage(tab.id, { type: "extract" }, (response) => {
+    chrome.tabs.sendMessage(tab.id, { type: "extract" }, async (response) => {
       if (chrome.runtime.lastError) {
         statusEl.textContent = "reload page to inject extractor";
         return;
       }
       if (!response) { statusEl.textContent = "no data returned"; return; }
       data = response;
+
+      // Store and diff
+      try {
+        const result = await store.put(data);
+        currentCid = result.cid;
+        if (result.prevCid && result.isNew) {
+          const prev = await store.get(result.prevCid);
+          if (prev) lastDiff = store.diff(prev.data, data);
+          else lastDiff = null;
+        } else {
+          lastDiff = result.isNew ? null : { changes: [], hasChanges: false };
+        }
+      } catch (e) {
+        console.warn("store error:", e);
+        currentCid = null;
+        lastDiff = null;
+      }
+
       updateBadges();
       render();
     });
@@ -75,12 +96,24 @@
     const q = filterEl.value.toLowerCase();
 
     content.innerHTML = "";
+
+    // Diff banner on applicable views
+    if (currentView !== "history" && currentView !== "raw") {
+      renderDiffBanner();
+    }
+    // CID indicator
+    if (currentCid && currentView !== "history") {
+      const cidEl = el("div", "status", `cid: ${currentCid.slice(0, 12)}...`);
+      content.appendChild(cidEl);
+    }
+
     switch (currentView) {
       case "surfaces": renderSurfaces(q); break;
       case "tables":   renderTables(q); break;
       case "links":    renderLinks(q); break;
       case "forms":    renderForms(q); break;
       case "raw":      renderRaw(q); break;
+      case "history":  renderHistory(q); break;
     }
   }
 
@@ -573,6 +606,128 @@
   }
 
   // ============================================================
+  //  DIFF BANNER
+  // ============================================================
+
+  function renderDiffBanner() {
+    if (!lastDiff) return;
+    if (!lastDiff.hasChanges) {
+      const banner = el("div", "diff-banner same", "no changes since last extraction");
+      content.appendChild(banner);
+      return;
+    }
+    const banner = el("div", "diff-banner changed");
+    banner.innerHTML = `<strong>${lastDiff.changes.length} change${lastDiff.changes.length > 1 ? "s" : ""} since last extraction:</strong>`;
+    for (const c of lastDiff.changes) {
+      const line = el("div", "diff-line");
+      switch (c.type) {
+        case "added":
+          line.className = "diff-line diff-added";
+          line.textContent = `+ ${c.path}: ${c.items.join(", ")}`;
+          break;
+        case "removed":
+          line.className = "diff-line diff-removed";
+          line.textContent = `- ${c.path}: ${c.items.join(", ")}`;
+          break;
+        case "changed":
+          line.className = "diff-line diff-changed";
+          line.textContent = `~ ${c.path}: ${c.old} -> ${c.new}`;
+          break;
+      }
+      banner.appendChild(line);
+    }
+    content.appendChild(banner);
+  }
+
+  // ============================================================
+  //  HISTORY VIEW
+  // ============================================================
+
+  async function renderHistory(q) {
+    const sec = section("history");
+    let entries;
+    try {
+      entries = await store.recent(200);
+    } catch (e) {
+      sec.appendChild(el("div", "empty", "storage error: " + e.message));
+      content.appendChild(sec);
+      return;
+    }
+    if (!entries.length) {
+      sec.appendChild(el("div", "empty", "no extractions stored yet"));
+      content.appendChild(sec);
+      return;
+    }
+
+    // Filter
+    if (q) {
+      entries = entries.filter(e =>
+        matches(e.title + e.url + e.cid, q)
+      );
+    }
+
+    // Group by domain
+    const groups = new Map();
+    for (const entry of entries) {
+      let host;
+      try { host = new URL(entry.url).hostname; } catch { host = "other"; }
+      if (!groups.has(host)) groups.set(host, []);
+      groups.get(host).push(entry);
+    }
+
+    // Sort groups by most recent entry
+    const sorted = [...groups.entries()].sort((a, b) =>
+      b[1][0].timestamp.localeCompare(a[1][0].timestamp)
+    );
+
+    for (const [host, hostEntries] of sorted) {
+      const header = el("div", "hist-domain-header");
+      header.innerHTML = `${esc(host)}<span class="section-count">${hostEntries.length}</span>`;
+      sec.appendChild(header);
+
+      for (const entry of hostEntries) {
+        const row = el("div", "hist-entry selectable");
+        row.dataset.cid = entry.cid;
+        row.dataset.href = entry.url;
+
+        const isCurrent = entry.cid === currentCid;
+        const ago = timeAgo(entry.timestamp);
+
+        row.innerHTML = `<span class="hist-title">${esc(entry.title || "(untitled)")}${isCurrent ? '<span class="pill">current</span>' : ""}</span>`
+          + `<span class="hist-url">${esc(entry.url)}</span>`
+          + `<span class="hist-meta"><span>${ago}</span><span class="hist-cid">${entry.cid.slice(0, 10)}</span></span>`;
+
+        sec.appendChild(row);
+        selectables.push(row);
+      }
+    }
+
+    content.appendChild(sec);
+
+    // Update badge
+    const hstTab = tabs.find(t => t.dataset.view === "history");
+    if (hstTab) {
+      const existing = hstTab.querySelector(".badge");
+      if (existing) existing.remove();
+      const b = document.createElement("span");
+      b.className = "badge";
+      b.textContent = entries.length;
+      hstTab.appendChild(b);
+    }
+  }
+
+  function timeAgo(isoStr) {
+    const diff = Date.now() - new Date(isoStr).getTime();
+    const mins = Math.floor(diff / 60000);
+    if (mins < 1) return "just now";
+    if (mins < 60) return `${mins}m ago`;
+    const hrs = Math.floor(mins / 60);
+    if (hrs < 24) return `${hrs}h ago`;
+    const days = Math.floor(hrs / 24);
+    return `${days}d ago`;
+  }
+
+  // ============================================================
   //  VIEW SWITCHING
   // ============================================================
 
@@ -620,12 +775,63 @@
     flashStatus("section copied as JSON");
   }
 
-  function openSelected() {
+  function handleEnter() {
     if (selectedIdx < 0 || !selectables[selectedIdx]) return;
-    const href = selectables[selectedIdx].dataset.href;
+    const node = selectables[selectedIdx];
+
+    // History: load that extraction
+    if (currentView === "history" && node.dataset.cid) {
+      loadFromHistory(node.dataset.cid);
+      return;
+    }
+
+    // Otherwise open link
+    const href = node.dataset.href;
     if (href) { window.open(href, "_blank"); return; }
-    const a = selectables[selectedIdx].querySelector("a[href]");
+    const a = node.querySelector("a[href]");
     if (a) window.open(a.href, "_blank");
+  }
+
+  async function loadFromHistory(cid) {
+    try {
+      const record = await store.get(cid);
+      if (!record) { flashStatus("not found"); return; }
+      data = record.data;
+      currentCid = record.cid;
+      lastDiff = null;
+      updateBadges();
+      switchView("surfaces");
+      flashStatus(`loaded ${cid.slice(0, 10)}`);
+    } catch (e) {
+      flashStatus("load error: " + e.message);
+    }
+  }
+
+  async function deleteSelected() {
+    if (selectedIdx < 0 || !selectables[selectedIdx]) return;
+    const cid = selectables[selectedIdx].dataset.cid;
+    if (!cid) return;
+    try {
+      await store.remove(cid);
+      flashStatus(`deleted ${cid.slice(0, 10)}`);
+      render(); // re-render history
+    } catch (e) {
+      flashStatus("delete error");
+    }
+  }
+
+  function exportMarkdown() {
+    if (!data) { flashStatus("nothing to export"); return; }
+    const md = store.toMarkdown(data);
+    navigator.clipboard.writeText(md);
+    flashStatus("copied as markdown");
+  }
+
+  function exportJson() {
+    if (!data) { flashStatus("nothing to export"); return; }
+    const json = store.toJson(data);
+    navigator.clipboard.writeText(json);
+    flashStatus("copied as JSON");
   }
 
   function flashStatus(msg) {
@@ -645,7 +851,7 @@
     if (e.key === "?" && !inFilter) { helpEl.classList.toggle("visible"); return; }
     if (inFilter) return; // let filter handle its own input
 
-    const viewKeys = { "1": "surfaces", "2": "tables", "3": "links", "4": "forms", "5": "raw" };
+    const viewKeys = { "1": "surfaces", "2": "tables", "3": "links", "4": "forms", "5": "raw", "6": "history" };
     if (viewKeys[e.key]) { switchView(viewKeys[e.key]); return; }
 
     switch (e.key) {
@@ -683,10 +889,13 @@
       case "H": toggleAll(false); break;
       case "y": copySelected(); break;
       case "Y": copySectionJson(); break;
-      case "Enter": openSelected(); break;
+      case "x": exportMarkdown(); break;
+      case "X": exportJson(); break;
+      case "Enter": handleEnter(); break;
       case "r": extract(); break;
-      case "g": select(0); break; // jump to top
-      case "G": select(selectables.length - 1); break; // jump to bottom
+      case "g": select(0); break;
+      case "G": select(selectables.length - 1); break;
+      case "d": if (currentView === "history") deleteSelected(); break;
     }
   });
 
