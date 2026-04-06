@@ -2,3 +2,5 @@ node_modules/
 .DS_Store
 *.crx
 *.pem
+__pycache__/
+*.pyc
