@@ -1,0 +1,136 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Tablosco</title>
+<style>
+  :root {
+    --bg: #0d1117;
+    --surface: #161b22;
+    --border: #30363d;
+    --text: #c9d1d9;
+    --text-dim: #8b949e;
+    --accent: #58a6ff;
+    --accent-dim: #1f6feb;
+    --warn: #d29922;
+    --mono: "Berkeley Mono", "JetBrains Mono", "Fira Code", monospace;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font: 12px/1.5 var(--mono);
+    overflow-x: hidden;
+  }
+  #toolbar {
+    position: sticky; top: 0; z-index: 10;
+    display: flex; gap: 4px; padding: 6px 8px;
+    background: var(--surface);
+    border-bottom: 1px solid var(--border);
+  }
+  .tab-btn {
+    background: none; border: 1px solid transparent;
+    color: var(--text-dim); font: inherit; cursor: pointer;
+    padding: 2px 8px; border-radius: 3px;
+  }
+  .tab-btn:hover { color: var(--text); }
+  .tab-btn.active { color: var(--accent); border-color: var(--accent-dim); }
+  .tab-btn:focus { outline: 1px solid var(--accent); outline-offset: 1px; }
+  #filter {
+    flex: 1; background: var(--bg); border: 1px solid var(--border);
+    color: var(--text); font: inherit; padding: 2px 6px;
+    border-radius: 3px; min-width: 0;
+  }
+  #filter:focus { border-color: var(--accent); outline: none; }
+
+  #content { padding: 8px; }
+  .section { margin-bottom: 12px; }
+  .section-title {
+    color: var(--accent); font-size: 11px; text-transform: uppercase;
+    letter-spacing: 0.5px; margin-bottom: 4px; padding-bottom: 2px;
+    border-bottom: 1px solid var(--border);
+  }
+  .kv { display: flex; gap: 8px; padding: 1px 0; }
+  .kv-key { color: var(--text-dim); min-width: 100px; flex-shrink: 0; }
+  .kv-val { word-break: break-all; }
+  .kv-val a { color: var(--accent); text-decoration: none; }
+  .kv-val a:hover { text-decoration: underline; }
+
+  table.data {
+    width: 100%; border-collapse: collapse;
+    font-size: 11px; margin-top: 4px;
+  }
+  table.data th, table.data td {
+    text-align: left; padding: 3px 6px;
+    border: 1px solid var(--border);
+  }
+  table.data th { background: var(--surface); color: var(--accent); }
+  table.data tr:hover { background: var(--surface); }
+  table.data tr.selected { background: var(--accent-dim); }
+
+  .heading-list { list-style: none; }
+  .heading-list li { padding: 1px 0; }
+  .heading-list .h1 { font-weight: bold; }
+  .heading-list .h2 { padding-left: 12px; }
+  .heading-list .h3 { padding-left: 24px; color: var(--text-dim); }
+  .heading-list .h4 { padding-left: 36px; color: var(--text-dim); font-size: 11px; }
+
+  .readable { white-space: pre-wrap; font-size: 11px; color: var(--text-dim); max-height: 400px; overflow-y: auto; }
+  .link-row { padding: 1px 0; }
+  .link-row a { color: var(--accent); text-decoration: none; }
+  .form-block { margin-bottom: 8px; padding: 4px; border: 1px solid var(--border); border-radius: 3px; }
+  .form-field { color: var(--text-dim); font-size: 11px; }
+
+  .empty { color: var(--text-dim); font-style: italic; }
+  .status { padding: 4px 8px; color: var(--text-dim); font-size: 11px; }
+  .json-raw { white-space: pre-wrap; font-size: 10px; max-height: 300px; overflow-y: auto; background: var(--surface); padding: 4px; border-radius: 3px; }
+
+  .help-overlay {
+    display: none; position: fixed; inset: 0; z-index: 100;
+    background: rgba(0,0,0,0.8); padding: 20px;
+  }
+  .help-overlay.visible { display: flex; align-items: center; justify-content: center; }
+  .help-box {
+    background: var(--surface); border: 1px solid var(--border);
+    padding: 16px; border-radius: 6px; max-width: 320px; width: 100%;
+  }
+  .help-box h3 { color: var(--accent); margin-bottom: 8px; }
+  .help-box kbd {
+    background: var(--bg); border: 1px solid var(--border);
+    padding: 1px 4px; border-radius: 2px; font: inherit;
+  }
+</style>
+</head>
+<body>
+
+<div id="toolbar">
+  <button class="tab-btn active" data-view="surfaces">srf</button>
+  <button class="tab-btn" data-view="tables">tbl</button>
+  <button class="tab-btn" data-view="links">lnk</button>
+  <button class="tab-btn" data-view="forms">frm</button>
+  <button class="tab-btn" data-view="raw">raw</button>
+  <input id="filter" type="text" placeholder="/ filter" spellcheck="false">
+</div>
+
+<div id="content">
+  <div class="status" id="status">Alt+E to extract &middot; ? for help</div>
+</div>
+
+<div class="help-overlay" id="help">
+  <div class="help-box">
+    <h3>Tablosco keys</h3>
+    <p><kbd>Alt+E</kbd> extract page</p>
+    <p><kbd>1-5</kbd> switch view (srf/tbl/lnk/frm/raw)</p>
+    <p><kbd>/</kbd> focus filter</p>
+    <p><kbd>j</kbd>/<kbd>k</kbd> navigate rows</p>
+    <p><kbd>Enter</kbd> open selected link</p>
+    <p><kbd>y</kbd> copy selected row</p>
+    <p><kbd>Esc</kbd> clear filter / close help</p>
+    <p><kbd>?</kbd> toggle help</p>
+    <p><kbd>r</kbd> re-extract</p>
+  </div>
+</div>
+
+<script src="sidepanel.js"></script>
+</body>
+</html>

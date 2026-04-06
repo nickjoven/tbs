@@ -1,0 +1,42 @@
+{
+  "manifest_version": 3,
+  "name": "Tablosco",
+  "version": "0.1.0",
+  "description": "Semantic extraction and tabulation of web content. Keyboard-first.",
+  "permissions": [
+    "sidePanel",
+    "activeTab",
+    "scripting"
+  ],
+  "side_panel": {
+    "default_path": "sidepanel.html"
+  },
+  "background": {
+    "service_worker": "background.js"
+  },
+  "commands": {
+    "_execute_action": {
+      "suggested_key": {
+        "default": "Alt+T"
+      },
+      "description": "Toggle Tablosco side panel"
+    },
+    "extract": {
+      "suggested_key": {
+        "default": "Alt+E"
+      },
+      "description": "Extract current page"
+    }
+  },
+  "action": {
+    "default_title": "Tablosco"
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["extractor.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "icons": {}
+}
