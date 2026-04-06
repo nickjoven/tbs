@@ -1,0 +1,517 @@
+#!/usr/bin/env python3
+"""
+tbl — tablosco shell
+Vim-mode CLI wrapper for Claude Code. Your input box is a workspace.
+
+Keys (vi normal mode):
+  Enter        send buffer to claude
+  :q           quit
+  :ctx <path>  attach file as context
+  :clr         clear context
+  :hist        show conversation history
+  :!<cmd>      shell escape
+  :paste       enter paste mode (multi-line, end with :end)
+  :set <opt>   toggle options (wrap, stream)
+
+The editor is vi-mode by default. All standard vim motions work
+in the input buffer: hjkl, w/b/e, ciw, dd, yy, p, /, etc.
+"""
+
+import sys
+import os
+import subprocess
+import json
+import shutil
+import signal
+from pathlib import Path
+from datetime import datetime
+
+from prompt_toolkit import PromptSession
+from prompt_toolkit.key_binding import KeyBindings
+from prompt_toolkit.keys import Keys
+from prompt_toolkit.enums import EditingMode
+from prompt_toolkit.history import FileHistory
+from prompt_toolkit.lexers import PygmentsLexer
+from prompt_toolkit.styles import Style
+from prompt_toolkit.formatted_text import HTML
+from prompt_toolkit.shortcuts import clear
+
+from rich.console import Console
+from rich.markdown import Markdown
+from rich.panel import Panel
+from rich.text import Text
+from rich.theme import Theme
+
+# ── Config ──────────────────────────────────────────────────────
+
+HISTORY_FILE = Path.home() / ".local" / "share" / "tbl" / "history"
+CONTEXT_DIR = Path.home() / ".local" / "share" / "tbl" / "context"
+CONV_LOG = Path.home() / ".local" / "share" / "tbl" / "conversations"
+
+CLAUDE_BIN = shutil.which("claude") or "claude"
+
+STYLE = Style.from_dict({
+    "prompt": "#58a6ff bold",
+    "mode":   "#8b949e",
+    "path":   "#3fb950",
+})
+
+RICH_THEME = Theme({
+    "info":    "dim cyan",
+    "warning": "yellow",
+    "error":   "bold red",
+    "accent":  "#58a6ff",
+    "dim":     "#8b949e",
+})
+
+# ── State ───────────────────────────────────────────────────────
+
+class Shell:
+    def __init__(self):
+        self.console = Console(theme=RICH_THEME)
+        self.context_files = []        # list of (path, content) attached
+        self.conversation = []         # list of {role, content, timestamp}
+        self.options = {
+            "wrap": True,
+            "stream": True,
+            "model": None,             # use default
+        }
+        self.cwd = Path.cwd()
+        self.session_id = datetime.now().strftime("%Y%m%d-%H%M%S")
+
+        # Ensure dirs
+        HISTORY_FILE.parent.mkdir(parents=True, exist_ok=True)
+        CONTEXT_DIR.mkdir(parents=True, exist_ok=True)
+        CONV_LOG.mkdir(parents=True, exist_ok=True)
+
+        self.session = PromptSession(
+            history=FileHistory(str(HISTORY_FILE)),
+            editing_mode=EditingMode.VI,
+            multiline=True,
+            key_bindings=self._keybindings(),
+            style=STYLE,
+            enable_open_in_editor=True,  # v in normal mode opens $EDITOR
+        )
+
+    def _keybindings(self):
+        kb = KeyBindings()
+
+        @kb.add(Keys.Escape, Keys.Enter)  # Alt+Enter = newline in multiline
+        def _(event):
+            event.current_buffer.insert_text("\n")
+
+        @kb.add(Keys.Enter, filter=lambda: True)
+        def _(event):
+            buf = event.current_buffer
+            text = buf.text.strip()
+
+            # In vi normal mode, Enter submits
+            # In vi insert mode, Enter is newline (handled by prompt_toolkit)
+            if event.app.vi_state.input_mode.value == "vi-navigation":
+                buf.validate_and_handle()
+            else:
+                buf.insert_text("\n")
+
+        return kb
+
+    def _prompt_text(self):
+        ctx_count = len(self.context_files)
+        ctx_indicator = f" [{ctx_count} ctx]" if ctx_count else ""
+        cwd_short = str(self.cwd).replace(str(Path.home()), "~")
+        return HTML(
+            f'<path>{cwd_short}</path>'
+            f'<mode>{ctx_indicator}</mode> '
+            f'<prompt>tbl></prompt> '
+        )
+
+    # ── Commands ────────────────────────────────────────────────
+
+    def handle_command(self, text):
+        """Handle :commands. Returns True if handled."""
+        if not text.startswith(":"):
+            return False
+
+        parts = text[1:].split(None, 1)
+        cmd = parts[0] if parts else ""
+        arg = parts[1] if len(parts) > 1 else ""
+
+        if cmd in ("q", "quit", "exit"):
+            self.save_conversation()
+            raise EOFError
+
+        elif cmd == "ctx":
+            self.cmd_ctx(arg)
+        elif cmd == "clip":
+            self.cmd_clip(arg)
+        elif cmd == "clr":
+            self.cmd_clr(arg)
+        elif cmd == "hist":
+            self.cmd_hist()
+        elif cmd == "paste":
+            self.cmd_paste()
+        elif cmd == "set":
+            self.cmd_set(arg)
+        elif cmd == "cd":
+            self.cmd_cd(arg)
+        elif cmd == "ls":
+            self.cmd_shell("ls " + arg)
+        elif cmd.startswith("!"):
+            self.cmd_shell(cmd[1:] + " " + arg)
+        elif cmd == "help":
+            self.cmd_help()
+        elif cmd == "save":
+            self.save_conversation()
+            self.console.print("[info]conversation saved[/info]")
+        else:
+            self.console.print(f"[error]unknown command: :{cmd}[/error]")
+
+        return True
+
+    def cmd_ctx(self, arg):
+        if not arg:
+            if not self.context_files:
+                self.console.print("[dim]no context attached[/dim]")
+            else:
+                for i, (p, c) in enumerate(self.context_files):
+                    size = len(c)
+                    self.console.print(f"[dim]{i}.[/dim] {p} [dim]({size} chars)[/dim]")
+            return
+
+        # Check if it's a glob
+        path = Path(arg).expanduser()
+        if not path.is_absolute():
+            path = self.cwd / path
+
+        if path.is_file():
+            try:
+                content = path.read_text()
+                self.context_files.append((str(path), content))
+                self.console.print(f"[info]attached {path.name} ({len(content)} chars)[/info]")
+            except Exception as e:
+                self.console.print(f"[error]can't read {path}: {e}[/error]")
+        elif path.is_dir():
+            self.console.print(f"[error]{path} is a directory. Use :ctx path/to/file[/error]")
+        else:
+            # Try glob
+            import glob as globmod
+            matches = sorted(globmod.glob(str(path)))
+            if matches:
+                for m in matches[:10]:
+                    mp = Path(m)
+                    if mp.is_file():
+                        try:
+                            content = mp.read_text()
+                            self.context_files.append((str(mp), content))
+                            self.console.print(f"[info]attached {mp.name} ({len(content)} chars)[/info]")
+                        except Exception:
+                            pass
+                if len(matches) > 10:
+                    self.console.print(f"[dim]...and {len(matches)-10} more (capped at 10)[/dim]")
+            else:
+                self.console.print(f"[error]not found: {arg}[/error]")
+
+    def cmd_clr(self, arg):
+        if arg == "ctx":
+            self.context_files.clear()
+            self.console.print("[info]context cleared[/info]")
+        elif arg == "conv":
+            self.conversation.clear()
+            self.console.print("[info]conversation cleared[/info]")
+        elif arg == "all":
+            self.context_files.clear()
+            self.conversation.clear()
+            self.console.print("[info]all cleared[/info]")
+        else:
+            self.context_files.clear()
+            self.console.print("[info]context cleared[/info]")
+
+    def cmd_hist(self):
+        if not self.conversation:
+            self.console.print("[dim]no conversation yet[/dim]")
+            return
+        for entry in self.conversation[-20:]:
+            role = entry["role"]
+            ts = entry.get("timestamp", "")
+            preview = entry["content"][:120].replace("\n", " ")
+            color = "accent" if role == "user" else "dim"
+            self.console.print(f"[{color}]{role}[/{color}] [dim]{ts}[/dim] {preview}")
+
+    def cmd_paste(self):
+        self.console.print("[dim]paste mode — type :end on its own line to finish[/dim]")
+        lines = []
+        while True:
+            try:
+                line = input()
+                if line.strip() == ":end":
+                    break
+                lines.append(line)
+            except EOFError:
+                break
+        text = "\n".join(lines)
+        if text.strip():
+            self.context_files.append(("paste", text))
+            self.console.print(f"[info]pasted {len(text)} chars as context[/info]")
+
+    def cmd_set(self, arg):
+        if not arg:
+            for k, v in self.options.items():
+                self.console.print(f"[dim]{k}[/dim] = {v}")
+            return
+        parts = arg.split("=", 1)
+        key = parts[0].strip()
+        if len(parts) == 2:
+            val = parts[1].strip()
+            if val.lower() in ("true", "1", "on"): val = True
+            elif val.lower() in ("false", "0", "off"): val = False
+            self.options[key] = val
+        elif key.startswith("no"):
+            self.options[key[2:]] = False
+        else:
+            self.options[key] = True
+        self.console.print(f"[info]{key} = {self.options.get(key, self.options.get(key.lstrip('no')))}[/info]")
+
+    def cmd_cd(self, arg):
+        if not arg:
+            self.cwd = Path.home()
+        else:
+            p = Path(arg).expanduser()
+            if not p.is_absolute():
+                p = self.cwd / p
+            p = p.resolve()
+            if p.is_dir():
+                self.cwd = p
+                os.chdir(p)
+                self.console.print(f"[info]{p}[/info]")
+            else:
+                self.console.print(f"[error]not a directory: {p}[/error]")
+
+    def cmd_shell(self, cmd):
+        if not cmd.strip():
+            return
+        try:
+            result = subprocess.run(
+                cmd, shell=True, capture_output=True, text=True,
+                cwd=str(self.cwd), timeout=30
+            )
+            if result.stdout:
+                self.console.print(result.stdout, end="")
+            if result.stderr:
+                self.console.print(f"[error]{result.stderr}[/error]", end="")
+        except subprocess.TimeoutExpired:
+            self.console.print("[error]command timed out (30s)[/error]")
+        except Exception as e:
+            self.console.print(f"[error]{e}[/error]")
+
+    def cmd_clip(self, _arg):
+        """Attach clipboard contents as context (from Tablosco x/X export)."""
+        try:
+            result = subprocess.run(
+                ["xclip", "-selection", "clipboard", "-o"],
+                capture_output=True, text=True, timeout=5
+            )
+            if result.returncode != 0:
+                # Try xsel as fallback
+                result = subprocess.run(
+                    ["xsel", "--clipboard", "--output"],
+                    capture_output=True, text=True, timeout=5
+                )
+            text = result.stdout.strip()
+            if not text:
+                # WSL: try powershell
+                result = subprocess.run(
+                    ["powershell.exe", "-command", "Get-Clipboard"],
+                    capture_output=True, text=True, timeout=5
+                )
+                text = result.stdout.strip()
+
+            if text:
+                # Detect if it's JSON (Tablosco X export)
+                label = "clipboard"
+                try:
+                    parsed = json.loads(text)
+                    if isinstance(parsed, dict) and "url" in parsed:
+                        label = f"tablosco:{parsed.get('url', 'extract')}"
+                except (json.JSONDecodeError, TypeError):
+                    pass
+
+                self.context_files.append((label, text))
+                self.console.print(f"[info]attached from clipboard ({len(text)} chars) as {label}[/info]")
+            else:
+                self.console.print("[dim]clipboard empty[/dim]")
+        except FileNotFoundError:
+            self.console.print("[error]no clipboard tool found (xclip/xsel/powershell)[/error]")
+        except Exception as e:
+            self.console.print(f"[error]clipboard error: {e}[/error]")
+
+    def cmd_help(self):
+        help_text = """
+[accent]tbl — tablosco shell[/accent]
+
+[dim]Input is vi-mode. Normal mode Enter submits. Insert mode Enter is newline.
+Esc to normal mode. v opens $EDITOR. Alt+Enter for newline in insert mode.[/dim]
+
+:ctx <path>     attach file as context
+:ctx            list attached context
+:clip           attach clipboard (Tablosco x/X export)
+:clr [ctx|conv|all]  clear context/conversation
+:hist           show conversation history
+:paste          multi-line paste mode (:end to finish)
+:set [opt=val]  show/toggle options
+:cd <path>      change directory
+:!<cmd>         run shell command
+:save           save conversation to disk
+:q              quit
+"""
+        self.console.print(help_text)
+
+    # ── Claude interaction ──────────────────────────────────────
+
+    def send_to_claude(self, user_input):
+        # Build the prompt with context
+        prompt_parts = []
+
+        if self.context_files:
+            prompt_parts.append("--- attached context ---")
+            for path, content in self.context_files:
+                prompt_parts.append(f"[{path}]\n{content}")
+            prompt_parts.append("--- end context ---\n")
+
+        prompt_parts.append(user_input)
+        full_prompt = "\n".join(prompt_parts)
+
+        # Log user turn
+        self.conversation.append({
+            "role": "user",
+            "content": user_input,
+            "timestamp": datetime.now().isoformat(timespec="seconds"),
+            "context_count": len(self.context_files),
+        })
+
+        # Build claude command
+        cmd = [CLAUDE_BIN, "--print"]
+        if self.options.get("model"):
+            cmd.extend(["--model", self.options["model"]])
+
+        self.console.print()
+        self.console.rule("[dim]claude[/dim]", style="dim")
+
+        try:
+            result = subprocess.run(
+                cmd,
+                input=full_prompt,
+                capture_output=True,
+                text=True,
+                cwd=str(self.cwd),
+                timeout=300,
+            )
+
+            response = result.stdout.strip()
+            if result.returncode != 0 and result.stderr:
+                self.console.print(f"[error]{result.stderr.strip()}[/error]")
+                if not response:
+                    return
+
+            # Render response as markdown
+            if response:
+                try:
+                    md = Markdown(response)
+                    self.console.print(md)
+                except Exception:
+                    self.console.print(response)
+
+            # Log assistant turn
+            self.conversation.append({
+                "role": "assistant",
+                "content": response,
+                "timestamp": datetime.now().isoformat(timespec="seconds"),
+            })
+
+            self.console.rule(style="dim")
+            self.console.print()
+
+        except subprocess.TimeoutExpired:
+            self.console.print("[error]claude timed out (5m)[/error]")
+        except FileNotFoundError:
+            self.console.print(f"[error]claude not found at {CLAUDE_BIN}[/error]")
+        except Exception as e:
+            self.console.print(f"[error]{e}[/error]")
+
+    # ── Conversation persistence ────────────────────────────────
+
+    def save_conversation(self):
+        if not self.conversation:
+            return
+        path = CONV_LOG / f"{self.session_id}.jsonl"
+        with open(path, "a") as f:
+            for entry in self.conversation:
+                f.write(json.dumps(entry) + "\n")
+        self.conversation.clear()
+
+    # ── Main loop ───────────────────────────────────────────────
+
+    def run(self):
+        self.console.print(
+            Panel(
+                "[accent]tbl[/accent] [dim]— tablosco shell[/dim]\n"
+                "[dim]vi-mode input. Esc→Enter to send. :help for commands.[/dim]",
+                border_style="dim",
+            )
+        )
+
+        while True:
+            try:
+                text = self.session.prompt(
+                    self._prompt_text,
+                    vi_mode=True,
+                )
+            except KeyboardInterrupt:
+                continue
+            except EOFError:
+                self.save_conversation()
+                self.console.print("[dim]bye[/dim]")
+                break
+
+            text = text.strip()
+            if not text:
+                continue
+
+            if self.handle_command(text):
+                continue
+
+            self.send_to_claude(text)
+
+
+def main():
+    import argparse
+    parser = argparse.ArgumentParser(description="tbl — tablosco shell")
+    parser.add_argument("files", nargs="*", help="files to attach as context on start")
+    parser.add_argument("-c", "--command", help="send a single prompt and exit")
+    args = parser.parse_args()
+
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    shell = Shell()
+
+    # Attach files from args
+    for f in (args.files or []):
+        shell.cmd_ctx(f)
+
+    # Pipe mode: read stdin if not a tty
+    if not sys.stdin.isatty():
+        piped = sys.stdin.read().strip()
+        if piped:
+            shell.context_files.append(("stdin", piped))
+            shell.console.print(f"[info]piped {len(piped)} chars from stdin[/info]")
+        # Reopen tty for interactive prompt
+        sys.stdin = open("/dev/tty", "r")
+
+    # Single command mode
+    if args.command:
+        shell.send_to_claude(args.command)
+        shell.save_conversation()
+        return
+
+    shell.run()
+
+
+if __name__ == "__main__":
+    main()
